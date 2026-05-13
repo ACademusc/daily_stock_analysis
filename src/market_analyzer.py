@@ -88,9 +88,22 @@ class MarketOverview:
     total_amount: float = 0.0           # 两市成交额（亿元）
     # north_flow: float = 0.0           # 北向资金净流入（亿元）- 已废弃，接口不可用
     
-    # 板块涨幅榜
+    # 板块涨幅榜（东方财富）
     top_sectors: List[Dict] = field(default_factory=list)     # 涨幅前5板块
     bottom_sectors: List[Dict] = field(default_factory=list)  # 跌幅前5板块
+
+    # 同花顺行业板块
+    ths_top_sectors: List[Dict] = field(default_factory=list)     # 同花顺行业涨幅前5
+    ths_bottom_sectors: List[Dict] = field(default_factory=list)  # 同花顺行业跌幅前5
+
+    # 同花顺概念板块
+    ths_top_concepts: List[Dict] = field(default_factory=list)     # 同花顺概念涨幅前5
+    ths_bottom_concepts: List[Dict] = field(default_factory=list)  # 同花顺概念跌幅前5
+    ths_hot_concepts: List[Dict] = field(default_factory=list)     # 同花顺概念成交额前5（资金热度）
+    ths_hot_sectors: List[Dict] = field(default_factory=list)      # 同花顺行业成交额前5（资金热度）
+
+    # 市场热门个股
+    hot_stocks: List[Dict] = field(default_factory=list)           # 市场关注度前5热门个股
 
 
 class MarketAnalyzer:
@@ -297,7 +310,19 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
         # 3. 获取板块涨跌榜（A 股有，美股暂无）
         if self.profile.has_sector_rankings:
             self._get_sector_rankings(overview)
-        
+
+        # 3.5 获取同花顺行业板块排名
+        if self.profile.has_sector_rankings:
+            self._get_ths_sector_rankings(overview)
+
+        # 3.6 获取同花顺概念板块排名（并行拉取全量，约30-40秒）
+        if self.profile.has_sector_rankings:
+            self._get_ths_concept_rankings(overview)
+
+        # 3.7 获取市场热门个股
+        if self.profile.has_sector_rankings:
+            self._get_hot_stocks(overview)
+
         # 4. 获取北向资金（可选）
         # self._get_north_flow(overview)
         
@@ -381,6 +406,146 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
         except Exception as e:
             logger.error(f"[大盘] 获取板块涨跌榜失败: {e}")
     
+    def _get_ths_sector_rankings(self, overview: MarketOverview):
+        """获取同花顺行业板块涨跌排名"""
+        try:
+            logger.info("[大盘] 获取同花顺行业板块排名...")
+            import akshare as ak
+            df = ak.stock_board_industry_summary_ths()
+
+            if df is None or df.empty:
+                logger.warning("[大盘] 同花顺行业板块数据为空")
+                return
+
+            # column mapping (garbled due to encoding, use positional)
+            col_name = df.columns[1]      # 板块名
+            col_change = df.columns[2]    # 涨跌幅
+            col_amount = df.columns[4]    # 总成交额
+            col_lead_name = df.columns[9] # 领涨股
+            col_lead_pct = df.columns[11] # 领涨股涨跌幅
+            col_up = df.columns[6]        # 上涨家数
+            col_down = df.columns[7]      # 下跌家数
+
+            df_sorted = df.sort_values(col_change, ascending=False)
+
+            all_sectors = []
+            for _, row in df.iterrows():
+                all_sectors.append({
+                    'name': str(row[col_name]),
+                    'change_pct': float(row[col_change]),
+                    'amount': float(row.get(col_amount, 0) or 0),
+                    'lead_stock': str(row.get(col_lead_name, '')),
+                    'lead_change_pct': float(row.get(col_lead_pct, 0) or 0),
+                    'up_count': int(row.get(col_up, 0) or 0),
+                    'down_count': int(row.get(col_down, 0) or 0),
+                })
+
+            overview.ths_top_sectors = all_sectors[:5]
+            overview.ths_bottom_sectors = list(reversed(all_sectors[-5:]))
+
+            # 按成交额排名 = 资金热度
+            hot_sectors = sorted(all_sectors, key=lambda x: x.get('amount', 0), reverse=True)
+            overview.ths_hot_sectors = hot_sectors[:5]
+
+            logger.info(f"[大盘] 同花顺领涨: {[s['name'] for s in overview.ths_top_sectors]}")
+            logger.info(f"[大盘] 同花顺领跌: {[s['name'] for s in overview.ths_bottom_sectors]}")
+            logger.info(f"[大盘] 同花顺热门(成交额): {[s['name'] for s in overview.ths_hot_sectors]}")
+
+        except Exception as e:
+            logger.warning(f"[大盘] 获取同花顺行业板块失败: {e}")
+
+    def _get_ths_concept_rankings(self, overview: MarketOverview):
+        """获取同花顺概念板块涨跌排名（并行拉取全量概念）"""
+        try:
+            logger.info("[大盘] 获取同花顺概念板块排名...")
+            import akshare as ak
+            import concurrent.futures
+
+            names_df = ak.stock_board_concept_name_ths()
+            all_names = names_df['name'].tolist()
+
+            from datetime import datetime, timedelta
+            end_d = datetime.now().strftime('%Y%m%d')
+            start_d = (datetime.now() - timedelta(days=5)).strftime('%Y%m%d')
+
+            def _fetch_one(name):
+                try:
+                    df = ak.stock_board_concept_index_ths(symbol=name, start_date=start_d, end_date=end_d)
+                    if df is None or len(df) < 2:
+                        return None
+                    last = df.iloc[-1]
+                    prev = df.iloc[-2]
+                    if prev['收盘价'] == 0:
+                        return None
+                    pct = (last['收盘价'] - prev['收盘价']) / prev['收盘价'] * 100
+                    amount = float(last.get('成交额', 0) or 0) / 1e8  # 转为亿
+                    return {'name': name, 'close': last['收盘价'], 'change_pct': round(pct, 2), 'amount': round(amount, 1)}
+                except Exception:
+                    return None
+
+            results = []
+            with concurrent.futures.ThreadPoolExecutor(max_workers=15) as ex:
+                futures = {ex.submit(_fetch_one, name): name for name in all_names}
+                for f in concurrent.futures.as_completed(futures):
+                    r = f.result()
+                    if r:
+                        results.append(r)
+
+            results.sort(key=lambda x: x['change_pct'], reverse=True)
+
+            overview.ths_top_concepts = results[:5]
+            overview.ths_bottom_concepts = list(reversed(results[-5:]))
+
+            # 按成交额排名 = 资金热度（热门板块）
+            hot = sorted(results, key=lambda x: x.get('amount', 0), reverse=True)
+            overview.ths_hot_concepts = hot[:5]
+
+            # 补充龙头股信息（延迟到热门个股获取后）
+            overview._ths_concepts_to_enrich = True
+
+            logger.info(f"[大盘] 同花顺概念领涨: {[c['name'] for c in overview.ths_top_concepts]}")
+            logger.info(f"[大盘] 同花顺概念领跌: {[c['name'] for c in overview.ths_bottom_concepts]}")
+            logger.info(f"[大盘] 同花顺概念热门(成交额): {[c['name'] for c in overview.ths_hot_concepts]}")
+
+        except Exception as e:
+            logger.warning(f"[大盘] 获取同花顺概念板块失败: {e}")
+
+    def _enrich_concept_leaders(self, concepts: List[Dict], hot_stocks: List[Dict] = None):
+        """为概念板块补充代表个股信息"""
+        if not concepts:
+            return
+        for c in concepts:
+            if not c.get('lead_stock'):
+                c['lead_stock'] = '-'
+
+    def _get_hot_stocks(self, overview: MarketOverview):
+        """获取市场关注度最高热门个股"""
+        try:
+            logger.info("[大盘] 获取市场热门个股...")
+            import akshare as ak
+            df = ak.stock_hot_rank_em()
+            if df is None or df.empty:
+                return
+
+            hot = []
+            for _, row in df.head(5).iterrows():
+                hot.append({
+                    'name': str(row.iloc[2]),           # 股票名称
+                    'code': str(row.iloc[1])[2:],       # 股票代码
+                    'price': float(row.iloc[3]),         # 最新价
+                    'change_pct': float(row.iloc[5]),    # 涨跌幅
+                })
+            overview.hot_stocks = hot
+            logger.info(f"[大盘] 热门个股: {[s['name'] for s in hot]}")
+
+            # 补充概念板块代表个股
+            self._enrich_concept_leaders(overview.ths_top_concepts, hot)
+            self._enrich_concept_leaders(overview.ths_bottom_concepts, hot)
+            self._enrich_concept_leaders(overview.ths_hot_concepts, hot)
+
+        except Exception as e:
+            logger.warning(f"[大盘] 获取热门个股失败: {e}")
+
     # def _get_north_flow(self, overview: MarketOverview):
     #     """获取北向资金流入"""
     #     try:
@@ -420,7 +585,7 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
         
         try:
             logger.info("[大盘] 开始搜索市场新闻...")
-            
+
             # 根据 region 设置搜索上下文名称，避免美股搜索被解读为 A 股语境
             market_names = {"cn": "大盘", "us": "US market", "hk": "HK market"}
             market_name = market_names.get(self.region, "大盘")
@@ -434,13 +599,42 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
                 if response and response.results:
                     all_news.extend(response.results)
                     logger.info(f"[大盘] 搜索 '{query}' 获取 {len(response.results)} 条结果")
-            
+
+            # 额外使用 MX 妙想搜索（东方财富官方资讯）
+            self._fetch_mx_news(all_news)
+
             logger.info(f"[大盘] 共获取 {len(all_news)} 条市场新闻")
-            
+
         except Exception as e:
             logger.error(f"[大盘] 搜索市场新闻失败: {e}")
-        
+
         return all_news
+
+    def _fetch_mx_news(self, all_news: List):
+        """使用 MX 妙想搜索补充金融资讯"""
+        try:
+            from src.mx_fetcher import MXFetcher
+            mx = MXFetcher()
+            if not mx.api_key:
+                return
+
+            logger.info("[大盘] MX 妙想搜索市场资讯...")
+            mx_results = mx.search_news("今日A股大盘综述 领涨板块 资金流向 后市展望", 6)
+
+            # 转换为 SimpleNamespace 兼容现有格式
+            from types import SimpleNamespace
+            for item in mx_results:
+                all_news.append(SimpleNamespace(
+                    title=item.get("title", ""),
+                    snippet=item.get("snippet", ""),
+                    source=item.get("source", "东方财富妙想"),
+                    published_date=item.get("date", ""),
+                    url="",
+                ))
+
+            logger.info(f"[大盘] MX 搜索获取 {len(mx_results)} 条资讯")
+        except Exception as e:
+            logger.warning(f"[大盘] MX 搜索失败: {e}")
     
     def generate_market_review(self, overview: MarketOverview, news: List) -> str:
         """
@@ -725,6 +919,77 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
                 lines.append(
                     f"| {rank} | {sector.get('name', '-')} | {self._format_signed_pct(sector.get('change_pct'))} |"
                 )
+
+        # 同花顺行业板块
+        if overview.ths_top_sectors or overview.ths_bottom_sectors:
+            if lines:
+                lines.append("")
+            lines.append("#### 同花顺行业板块 Top 5")
+            lines.append("| 排名 | 行业板块 | 涨跌幅 | 领涨股 | 领涨股涨幅 |")
+            lines.append("|------|----------|--------|--------|------------|")
+            for rank, s in enumerate(overview.ths_top_sectors[:5], 1):
+                lines.append(
+                    f"| {rank} | {s.get('name', '-')} | {self._format_signed_pct(s.get('change_pct'))} | "
+                    f"{s.get('lead_stock', '-')} | {self._format_signed_pct(s.get('lead_change_pct'))} |"
+                )
+            lines.append("")
+            lines.append("| 排名 | 行业板块 | 涨跌幅 | 领涨股 | 领涨股涨幅 |")
+            lines.append("|------|----------|--------|--------|------------|")
+            for rank, s in enumerate(overview.ths_bottom_sectors[:5], 1):
+                lines.append(
+                    f"| {rank} | {s.get('name', '-')} | {self._format_signed_pct(s.get('change_pct'))} | "
+                    f"{s.get('lead_stock', '-')} | {self._format_signed_pct(s.get('lead_change_pct'))} |"
+                )
+
+        # 同花顺概念板块
+        if overview.ths_top_concepts or overview.ths_bottom_concepts:
+            if lines:
+                lines.append("")
+            lines.append("#### 同花顺概念板块 Top 5")
+            lines.append("| 排名 | 概念板块 | 涨跌幅 | 代表个股 |")
+            lines.append("|------|----------|--------|----------|")
+            for rank, s in enumerate(overview.ths_top_concepts[:5], 1):
+                lead = s.get('lead_stock', '-')
+                lines.append(
+                    f"| {rank} | {s.get('name', '-')} | {self._format_signed_pct(s.get('change_pct'))} | {lead} |"
+                )
+            lines.append("")
+            lines.append("| 排名 | 概念板块 | 涨跌幅 | 代表个股 |")
+            lines.append("|------|----------|--------|----------|")
+            for rank, s in enumerate(overview.ths_bottom_concepts[:5], 1):
+                lead = s.get('lead_stock', '-')
+                lines.append(
+                    f"| {rank} | {s.get('name', '-')} | {self._format_signed_pct(s.get('change_pct'))} | {lead} |"
+                )
+
+        # 资金热度板块（成交额排名）
+        if overview.ths_hot_sectors or overview.ths_hot_concepts:
+            if lines:
+                lines.append("")
+            lines.append("#### 资金热度 Top 5（成交额排名）")
+            lines.append("| 排名 | 行业板块 | 成交额(亿) | 代表个股 | 概念板块 | 成交额(亿) | 代表个股 |")
+            lines.append("|------|----------|-----------|----------|----------|-----------|----------|")
+            for rank in range(5):
+                sec = overview.ths_hot_sectors[rank] if rank < len(overview.ths_hot_sectors) else {}
+                con = overview.ths_hot_concepts[rank] if rank < len(overview.ths_hot_concepts) else {}
+                lines.append(
+                    f"| {rank+1} | {sec.get('name', '-')} | {sec.get('amount', '-')} | {sec.get('lead_stock', '-')} | "
+                    f"{con.get('name', '-')} | {con.get('amount', '-')} | {con.get('lead_stock', '-')} |"
+                )
+
+        # 市场热门个股
+        if overview.hot_stocks:
+            if lines:
+                lines.append("")
+            lines.append("#### 市场热门个股 Top 5（关注度排名）")
+            lines.append("| 排名 | 股票 | 代码 | 最新价 | 涨跌幅 |")
+            lines.append("|------|------|------|--------|--------|")
+            for rank, s in enumerate(overview.hot_stocks[:5], 1):
+                lines.append(
+                    f"| {rank} | {s.get('name', '-')} | {s.get('code', '-')} | "
+                    f"{s.get('price', '-')} | {self._format_signed_pct(s.get('change_pct'))} |"
+                )
+
         return "\n".join(lines)
 
     def _build_news_block(self, news: List) -> str:
@@ -918,6 +1183,43 @@ Lagging: {bottom_sectors_text if bottom_sectors_text else "N/A"}"""
             else:
                 sector_block = "## 板块表现\n（该市场暂无板块涨跌数据）"
 
+            # 同花顺行业板块（中文报告专属）
+            ths_sector_block = ""
+            if self.profile.has_sector_rankings and review_language == "zh":
+                ths_top = ", ".join([f"{s['name']}({s['change_pct']:+.2f}%, 领涨:{s.get('lead_stock','')}{s.get('lead_change_pct',0):+.1f}%)" for s in overview.ths_top_sectors[:5]])
+                ths_bottom = ", ".join([f"{s['name']}({s['change_pct']:+.2f}%, 领涨:{s.get('lead_stock','')}{s.get('lead_change_pct',0):+.1f}%)" for s in overview.ths_bottom_sectors[:5]])
+                if ths_top or ths_bottom:
+                    ths_sector_block = f"""## 同花顺行业板块
+同花顺领涨行业: {ths_top if ths_top else "暂无数据"}
+同花顺领跌行业: {ths_bottom if ths_bottom else "暂无数据"}"""
+
+            # 同花顺概念板块
+            ths_concept_block = ""
+            if self.profile.has_sector_rankings and review_language == "zh":
+                ths_concept_top = ", ".join([f"{s['name']}({s['change_pct']:+.2f}%)" for s in overview.ths_top_concepts[:5]])
+                ths_concept_bottom = ", ".join([f"{s['name']}({s['change_pct']:+.2f}%)" for s in overview.ths_bottom_concepts[:5]])
+                if ths_concept_top or ths_concept_bottom:
+                    ths_concept_block = f"""## 同花顺概念板块
+同花顺领涨概念: {ths_concept_top if ths_concept_top else "暂无数据"}
+同花顺领跌概念: {ths_concept_bottom if ths_concept_bottom else "暂无数据"}"""
+
+            # 资金热度板块
+            hot_block = ""
+            if self.profile.has_sector_rankings and review_language == "zh":
+                hot_sec = ", ".join([f"{s['name']}({s.get('amount',0)}亿)" for s in overview.ths_hot_sectors[:5]])
+                hot_con = ", ".join([f"{s['name']}({s.get('amount',0)}亿)" for s in overview.ths_hot_concepts[:5]])
+                if hot_sec or hot_con:
+                    hot_block = f"""## 资金热度（成交额排名）
+热门行业: {hot_sec if hot_sec else "暂无数据"}
+热门概念: {hot_con if hot_con else "暂无数据"}"""
+
+            # 热门个股
+            hot_stocks_block = ""
+            if self.profile.has_sector_rankings and review_language == "zh" and overview.hot_stocks:
+                stocks_text = ", ".join([f"{s['name']}({s['code']}, {s['change_pct']:+.1f}%)" for s in overview.hot_stocks[:5]])
+                hot_stocks_block = f"""## 市场热门个股（关注度Top5）
+{stocks_text}"""
+
         data_no_indices_hint = (
             "注意：由于行情数据获取失败，请主要根据【市场新闻】进行定性分析和总结，不要编造具体的指数点位。"
             if not indices_text
@@ -959,6 +1261,10 @@ Lagging: {bottom_sectors_text if bottom_sectors_text else "N/A"}"""
 {stats_block}
 
 {sector_block}
+{ths_sector_block}
+{ths_concept_block}
+{hot_block}
+{hot_stocks_block}
 
 ## Market News
 {news_placeholder}
@@ -1023,6 +1329,10 @@ Output the report content directly, no extra commentary.
 {stats_block}
 
 {sector_block}
+{ths_sector_block}
+{ths_concept_block}
+{hot_block}
+{hot_stocks_block}
 
 ## 市场新闻
 {news_placeholder}

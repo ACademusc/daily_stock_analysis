@@ -840,7 +840,7 @@ class Config:
     
     # === 定时任务配置 ===
     schedule_enabled: bool = False            # 是否启用定时任务
-    schedule_time: str = "18:00"              # 每日推送时间（HH:MM 格式）
+    schedule_time: str = "12:00,18:00"        # 每日推送时间（HH:MM 格式，逗号分隔多个）
     schedule_run_immediately: bool = True     # 启动时是否立即执行一次
     run_immediately: bool = True              # 启动时是否立即执行一次（非定时模式）
     market_review_enabled: bool = True        # 是否启用大盘复盘
@@ -1588,7 +1588,7 @@ class Config:
                 default='false',
                 prefer_env_file=True,
             ).lower() == 'true',
-            schedule_time=(schedule_time_value or '18:00').strip() or '18:00',
+            schedule_time=(schedule_time_value or '12:00,18:00').strip() or '12:00,18:00',
             schedule_run_immediately=schedule_run_immediately,
             run_immediately=legacy_run_immediately,
             market_review_enabled=os.getenv('MARKET_REVIEW_ENABLED', 'true').lower() == 'true',

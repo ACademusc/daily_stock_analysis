@@ -459,7 +459,6 @@ def run_full_analysis(
     """
     # Import pipeline modules outside the broad try/except so that import-time
     # failures propagate to the caller instead of being silently swallowed.
-    from src.core.market_review import run_market_review
     from src.core.pipeline import StockAnalysisPipeline
 
     try:
@@ -533,6 +532,7 @@ def run_full_analysis(
             and not args.no_market_review
             and effective_region != ''
         ):
+            from src.core.market_review import run_market_review
             review_result = _run_market_review_with_shared_lock(
                 config,
                 run_market_review,
@@ -732,12 +732,12 @@ def _build_schedule_time_provider(default_schedule_time: str):
     Fallback order:
     1. Process-level env override (set before launch) → honour it.
     2. Persisted config file value (written by WebUI) → use it.
-    3. Documented system default ``"18:00"`` → always fall back here so
+    3. Documented system default ``"12:00,18:00"`` → always fall back here so
        that clearing SCHEDULE_TIME in WebUI correctly resets the schedule.
     """
     from src.core.config_manager import ConfigManager
 
-    _SYSTEM_DEFAULT_SCHEDULE_TIME = "18:00"
+    _SYSTEM_DEFAULT_SCHEDULE_TIME = "12:00,18:00"
     manager = ConfigManager()
 
     def _provider() -> str:
